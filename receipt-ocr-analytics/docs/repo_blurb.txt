@@ -1,0 +1,2 @@
+Receipt OCR & Analytics Platform (v1) - OCR receipts and turn into structured data + analytics.
+FastAPI, Tesseract, SQLAlchemy, Alembic, Postgres, Docker Compose, CI, seed data, Postman, demo scripts.

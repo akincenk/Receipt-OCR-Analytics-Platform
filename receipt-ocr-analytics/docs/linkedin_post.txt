@@ -1,0 +1,9 @@
+I built a Receipt OCR & Analytics Platform — a production-grade FastAPI + Postgres API using Tesseract to parse receipt images into structured data and expose analytics.
+
+- Tesseract OCR + heuristic parser
+- One-command launch with Docker
+- Alembic migrations + seed data
+- Analytics endpoints (summary, vendor/category breakdown)
+- CI, Postman, and demo scripts included
+
+Open to roles where I can ship systems like this at pace.
