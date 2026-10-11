@@ -1,67 +1,111 @@
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
-from sqlalchemy.orm import Session
-from sqlalchemy import select
-import os, uuid
+import io
+import os
+import uuid
 from datetime import date
-from decimal import Decimal
 
-from app.db.session import get_db
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from PIL import Image, UnidentifiedImageError
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
 from app.core.settings import settings
-from app.models import Vendor, Receipt, ReceiptItem
-from app.services.ocr import ocr_image_to_text
+from app.db.session import get_db
+from app.models import Receipt, ReceiptItem, Vendor
+from app.services.ocr import OCRUnavailable, ocr_image_to_text
 from app.services.parser import parse_receipt_text
 
 router = APIRouter()
 
-def ensure_upload_dir():
-    os.makedirs(settings.upload_dir, exist_ok=True)
+# Pillow format name -> file extension. Anything else is rejected.
+ALLOWED_FORMATS = {"PNG": ".png", "JPEG": ".jpg", "TIFF": ".tif", "WEBP": ".webp"}
 
-@router.post("/upload")
-async def upload_receipt(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    ensure_upload_dir()
-    ext = os.path.splitext(file.filename or "file")[1].lower() or ".png"
-    fname = f"{uuid.uuid4().hex}{ext}"
-    fpath = os.path.join(settings.upload_dir, fname)
-    with open(fpath, "wb") as f:
-        f.write(await file.read())
 
+def _read_limited(file: UploadFile) -> bytes:
+    data = file.file.read(settings.max_upload_bytes + 1)
+    if len(data) > settings.max_upload_bytes:
+        raise HTTPException(status_code=413, detail=f"File larger than {settings.max_upload_bytes} bytes")
+    return data
+
+
+def _save_image(data: bytes) -> str:
+    """Check the bytes really are an allowed image type, then store them under a random name."""
     try:
-        txt = ocr_image_to_text(fpath)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"OCR failed: {e}")
+        with Image.open(io.BytesIO(data)) as img:
+            fmt = img.format
+            img.verify()
+    except (UnidentifiedImageError, OSError, SyntaxError) as e:
+        raise HTTPException(status_code=415, detail="File is not a valid image") from e
+    if fmt not in ALLOWED_FORMATS:
+        raise HTTPException(status_code=415, detail=f"Unsupported image type; allowed: {', '.join(ALLOWED_FORMATS)}")
+    os.makedirs(settings.upload_dir, exist_ok=True)
+    path = os.path.join(settings.upload_dir, uuid.uuid4().hex + ALLOWED_FORMATS[fmt])
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+@router.post("/upload", status_code=201)
+def upload_receipt(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    path = _save_image(_read_limited(file))
+    try:
+        txt = ocr_image_to_text(path)
+    except OCRUnavailable as e:
+        os.remove(path)
+        raise HTTPException(status_code=503, detail="OCR engine unavailable") from e
 
     data = parse_receipt_text(txt)
-    # Upsert vendor
     vendor = db.execute(select(Vendor).where(Vendor.name == data["vendor_name"])).scalar()
     if not vendor:
         vendor = Vendor(name=data["vendor_name"])
-        db.add(vendor); db.commit(); db.refresh(vendor)
+        db.add(vendor)
+        db.flush()
 
-    rec = Receipt(vendor_id=vendor.id, d=data["date"], currency=data["currency"], total=data["total"], raw_text=data["raw_text"], image_path=fpath)
-    db.add(rec); db.commit(); db.refresh(rec)
-
-    for it in data["items"]:
-        db.add(ReceiptItem(receipt_id=rec.id, name=it["name"], qty=it["qty"], unit_price=it["unit_price"], line_total=it["line_total"], category=it["category"]))
+    rec = Receipt(
+        vendor_id=vendor.id,
+        # No date found on the receipt: use the upload date and report date_detected=False.
+        d=data["date"] or date.today(),
+        currency=data["currency"],
+        total=data["total"],
+        raw_text=data["raw_text"],
+        image_path=path,
+    )
+    db.add(rec)
+    db.flush()
+    db.add_all(ReceiptItem(receipt_id=rec.id, **it) for it in data["items"])
     db.commit()
 
-    return {"id": rec.id, "vendor": vendor.name, "date": str(rec.d), "total": float(rec.total), "items": len(data["items"])}
+    return {
+        "id": rec.id,
+        "vendor": vendor.name,
+        "date": rec.d.isoformat(),
+        "date_detected": data["date"] is not None,
+        "total": float(rec.total),
+        "items": len(data["items"]),
+    }
+
 
 @router.get("/{receipt_id}")
 def get_receipt(receipt_id: int, db: Session = Depends(get_db)):
-    rec = db.execute(select(Receipt).where(Receipt.id == receipt_id)).scalar()
+    rec = db.get(Receipt, receipt_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Receipt not found")
-    items = list(db.execute(select(ReceiptItem).where(ReceiptItem.receipt_id == receipt_id)).scalars().all())
+    items = db.execute(select(ReceiptItem).where(ReceiptItem.receipt_id == receipt_id).order_by(ReceiptItem.id)).scalars()
     return {
         "id": rec.id,
         "vendor_id": rec.vendor_id,
-        "date": str(rec.d),
+        "date": rec.d.isoformat(),
         "currency": rec.currency,
         "total": float(rec.total),
         "raw_text": rec.raw_text,
-        "image_path": rec.image_path,
         "items": [
-            {"id": it.id, "name": it.name, "qty": it.qty, "unit_price": float(it.unit_price), "line_total": float(it.line_total), "category": it.category}
+            {
+                "id": it.id,
+                "name": it.name,
+                "qty": it.qty,
+                "unit_price": float(it.unit_price),
+                "line_total": float(it.line_total),
+                "category": it.category,
+            }
             for it in items
-        ]
+        ],
     }
